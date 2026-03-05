@@ -8,36 +8,66 @@ struct ContentView: View {
     @State private var webSocket = WebSocketClient()
     @State private var voicePipeline = VoicePipeline()
     @State private var showPermissionAlert = false
-    @State private var statusText = "Initializing..."
-    @State private var orbScale: CGFloat = 1.0
-    @State private var orbOpacity: Double = 0.4
+
+    // Boot sequence
+    @State private var bootPhase: BootPhase = .off
+    @State private var bootLines: [BootSequenceLine] = []
+    @State private var visibleBootLines: [BootSequenceLine] = []
+
+    // Orb animation
+    @State private var ringRotation1: Double = 0
+    @State private var ringRotation2: Double = 0
+    @State private var ringRotation3: Double = 0
+    @State private var coreScale: CGFloat = 0.0
+    @State private var corePulse: CGFloat = 1.0
+    @State private var orbGlow: CGFloat = 0.0
+
+    // Waveform
+    @State private var audioLevels: [CGFloat] = Array(repeating: 0.05, count: 40)
+    @State private var waveformTimer: Timer?
+
+    enum BootPhase {
+        case off, booting, ready
+    }
 
     var body: some View {
         ZStack {
-            VStack(spacing: 32) {
+            // Ambient CRT scan lines across entire panel
+            CRTScanLines(spacing: 3, opacity: 0.015)
+
+            VStack(spacing: 0) {
+                hudTopBar
+                    .opacity(bootPhase == .ready ? 1 : 0)
+                    .animation(.easeIn(duration: 0.6), value: bootPhase)
+
                 Spacer()
 
-                listeningOrb
-
-                statusLabel
-
-                connectionIndicator
+                if bootPhase == .booting {
+                    bootSequenceView
+                        .transition(.opacity)
+                } else if bootPhase == .ready {
+                    mainInterface
+                        .transition(.opacity)
+                }
 
                 Spacer()
 
-                windowCounter
+                hudBottomBar
+                    .opacity(bootPhase == .ready ? 1 : 0)
+                    .animation(.easeIn(duration: 0.6), value: bootPhase)
             }
-            .padding(40)
+            .padding(24)
         }
-        .frame(minWidth: 400, minHeight: 400)
-        .glassBackgroundEffect()
+        .frame(minWidth: 500, idealWidth: 600, minHeight: 550, idealHeight: 650)
+        .jarvisPanel()
         .onAppear {
             windowManager.bindActions(open: openWindow, dismiss: dismissWindow)
-            setupPipelines()
+            startBootSequence()
         }
         .onDisappear {
             voicePipeline.stopListening()
             webSocket.disconnect()
+            waveformTimer?.invalidate()
         }
         .alert("Permissions Required", isPresented: $showPermissionAlert) {
             Button("OK") {}
@@ -46,152 +76,352 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Listening Orb
+    // MARK: - HUD Top Bar
 
-    private var listeningOrb: some View {
+    private var hudTopBar: some View {
+        HStack {
+            // System status
+            HStack(spacing: 6) {
+                PulsingDot(color: connectionColor, size: 6)
+                Text(connectionLabel)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(JarvisColors.textDim)
+            }
+
+            Spacer()
+
+            Text("J.A.R.V.I.S.")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(JarvisColors.primary.opacity(0.5))
+                .tracking(4)
+
+            Spacer()
+
+            // Time display
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                Text(timeString(from: timeline.date))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(JarvisColors.textDim)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 4)
+    }
+
+    // MARK: - HUD Bottom Bar
+
+    private var hudBottomBar: some View {
+        HStack(spacing: 16) {
+            // Window count
+            if windowManager.windowCount > 0 {
+                HStack(spacing: 5) {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 10))
+                        .foregroundStyle(JarvisColors.primary.opacity(0.5))
+                    Text("\(windowManager.windowCount) PANEL\(windowManager.windowCount == 1 ? "" : "S")")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(JarvisColors.textDim)
+                }
+                .transition(.opacity)
+            }
+
+            Spacer()
+
+            // Pipeline state indicator
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(stateIndicatorColor)
+                    .frame(width: 5, height: 5)
+                Text(stateIndicatorLabel)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(JarvisColors.textDim)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
+        .animation(.easeInOut(duration: 0.3), value: windowManager.windowCount)
+    }
+
+    // MARK: - Boot Sequence
+
+    private var bootSequenceView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(visibleBootLines) { line in
+                Text(line.text)
+                    .font(.system(size: 11, weight: line.isHighlight ? .bold : .regular, design: .monospaced))
+                    .foregroundStyle(line.isHighlight ? JarvisColors.primary : JarvisColors.textDim)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .frame(maxWidth: 400, alignment: .leading)
+        .animation(.easeOut(duration: 0.15), value: visibleBootLines.count)
+    }
+
+    private func startBootSequence() {
+        bootPhase = .booting
+
+        bootLines = [
+            BootSequenceLine("Initializing J.A.R.V.I.S. v1.0...", delay: 0.0),
+            BootSequenceLine("Loading spatial rendering engine", delay: 0.3),
+            BootSequenceLine("AVAudioEngine .............. OK", delay: 0.6),
+            BootSequenceLine("Speech recognizer .......... OK", delay: 0.9),
+            BootSequenceLine("Whisper STT endpoint ....... OK", delay: 1.1),
+            BootSequenceLine("WebSocket client ........... CONNECTING", delay: 1.4),
+            BootSequenceLine("Connecting to Mac Mini gateway", delay: 1.7),
+            BootSequenceLine("Claude API bridge .......... STANDBY", delay: 2.0),
+            BootSequenceLine("Spatial window manager ..... READY", delay: 2.3),
+            BootSequenceLine("Voice pipeline ............. ACTIVE", delay: 2.6),
+            BootSequenceLine("", delay: 2.9),
+            BootSequenceLine("All systems nominal. Good evening, Dave.", delay: 3.0, highlight: true),
+        ]
+
+        for line in bootLines {
+            DispatchQueue.main.asyncAfter(deadline: .now() + line.delay) {
+                visibleBootLines.append(line)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            withAnimation(.easeInOut(duration: 0.6)) {
+                bootPhase = .ready
+            }
+            setupPipelines()
+            startOrbAnimations()
+        }
+    }
+
+    // MARK: - Main Interface (Post-Boot)
+
+    private var mainInterface: some View {
+        VStack(spacing: 24) {
+            arcReactorOrb
+
+            // Status text
+            VStack(spacing: 8) {
+                Text(statusMessage)
+                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    .foregroundStyle(JarvisColors.textPrimary)
+                    .animation(.easeInOut(duration: 0.3), value: voicePipeline.state)
+
+                if !voicePipeline.currentTranscript.isEmpty {
+                    Text(voicePipeline.currentTranscript)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(JarvisColors.primary.opacity(0.9))
+                        .lineLimit(3)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 400)
+                        .transition(.asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.95)),
+                            removal: .opacity
+                        ))
+                        .animation(.easeOut(duration: 0.2), value: voicePipeline.currentTranscript)
+                }
+            }
+
+            // Audio waveform (visible when listening)
+            if voicePipeline.state == .listening {
+                AudioWaveform(levels: audioLevels, barCount: 40, color: JarvisColors.primary)
+                    .frame(height: 44)
+                    .frame(maxWidth: 300)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .center)))
+                    .animation(.easeInOut(duration: 0.3), value: voicePipeline.state)
+            }
+        }
+    }
+
+    // MARK: - Arc Reactor Orb
+
+    private var arcReactorOrb: some View {
         ZStack {
-            // Outer glow
+            // Outer ambient glow
             Circle()
-                .fill(orbGradient)
-                .frame(width: 140, height: 140)
-                .blur(radius: 30)
-                .opacity(orbOpacity * 0.5)
-                .scaleEffect(orbScale * 1.3)
+                .fill(
+                    RadialGradient(
+                        colors: [
+                            JarvisColors.primary.opacity(0.15 * orbGlow),
+                            Color.clear
+                        ],
+                        center: .center,
+                        startRadius: 30,
+                        endRadius: 140
+                    )
+                )
+                .frame(width: 280, height: 280)
 
-            // Inner orb
+            // Ring 3 — outermost, slow rotation
+            orbRing(radius: 110, dashPattern: [8, 16], lineWidth: 0.8, opacity: 0.2)
+                .rotationEffect(.degrees(ringRotation3))
+
+            // Ring 2 — middle ring with thicker segments
+            orbRing(radius: 85, dashPattern: [20, 10, 4, 10], lineWidth: 1.2, opacity: 0.35)
+                .rotationEffect(.degrees(ringRotation2))
+
+            // Ring 1 — inner ring, fastest
+            orbRing(radius: 60, dashPattern: [12, 8], lineWidth: 1.5, opacity: 0.5)
+                .rotationEffect(.degrees(ringRotation1))
+
+            // Tick marks on outer ring
+            ForEach(0..<24, id: \.self) { i in
+                let angle = Double(i) * 15.0
+                let isMain = i % 6 == 0
+                Rectangle()
+                    .fill(JarvisColors.primary.opacity(isMain ? 0.3 : 0.1))
+                    .frame(width: isMain ? 1.5 : 0.8, height: isMain ? 12 : 6)
+                    .offset(y: -105)
+                    .rotationEffect(.degrees(angle))
+            }
+
+            // Energy core — outer
             Circle()
-                .fill(orbGradient)
-                .frame(width: 80, height: 80)
-                .opacity(orbOpacity)
-                .scaleEffect(orbScale)
+                .fill(
+                    RadialGradient(
+                        colors: [
+                            JarvisColors.accent.opacity(0.6),
+                            JarvisColors.primary.opacity(0.3),
+                            JarvisColors.secondary.opacity(0.1),
+                        ],
+                        center: .center,
+                        startRadius: 0,
+                        endRadius: 35
+                    )
+                )
+                .frame(width: 70, height: 70)
+                .scaleEffect(coreScale * corePulse)
+                .blur(radius: 1)
 
-            // Core
+            // Energy core — bright center
+            Circle()
+                .fill(
+                    RadialGradient(
+                        colors: [.white, JarvisColors.accent, JarvisColors.primary.opacity(0)],
+                        center: .center,
+                        startRadius: 0,
+                        endRadius: 18
+                    )
+                )
+                .frame(width: 36, height: 36)
+                .scaleEffect(coreScale * corePulse)
+
+            // Tiny core point
             Circle()
                 .fill(.white)
-                .frame(width: 20, height: 20)
-                .opacity(orbOpacity * 1.5)
-                .scaleEffect(orbScale * 0.8)
+                .frame(width: 6, height: 6)
+                .scaleEffect(coreScale)
+                .opacity(Double(corePulse))
         }
-        .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: orbScale)
-        .onChange(of: voicePipeline.state) { _, newState in
-            updateOrbAnimation(for: newState)
-        }
+        .frame(width: 240, height: 240)
     }
 
-    private var orbGradient: RadialGradient {
-        RadialGradient(
-            colors: orbColors,
-            center: .center,
-            startRadius: 0,
-            endRadius: 60
-        )
+    private func orbRing(radius: CGFloat, dashPattern: [CGFloat], lineWidth: CGFloat, opacity: Double) -> some View {
+        Circle()
+            .stroke(
+                JarvisColors.primary.opacity(opacity * Double(orbGlow)),
+                style: StrokeStyle(lineWidth: lineWidth, dash: dashPattern)
+            )
+            .frame(width: radius * 2, height: radius * 2)
     }
 
-    private var orbColors: [Color] {
-        switch voicePipeline.state {
-        case .idle:
-            return [.gray.opacity(0.3), .gray.opacity(0.1)]
-        case .waitingForWakeWord:
-            return [.cyan.opacity(0.6), .blue.opacity(0.2)]
-        case .listening:
-            return [.cyan, .blue.opacity(0.6)]
-        case .transcribing:
-            return [.purple, .cyan.opacity(0.4)]
+    // MARK: - Orb Animations
+
+    private func startOrbAnimations() {
+        // Core appears
+        withAnimation(.spring(response: 0.8, dampingFraction: 0.6)) {
+            coreScale = 1.0
         }
+
+        // Glow fades in
+        withAnimation(.easeIn(duration: 1.2)) {
+            orbGlow = 1.0
+        }
+
+        // Ring rotations — different speeds, different directions
+        withAnimation(.linear(duration: 20).repeatForever(autoreverses: false)) {
+            ringRotation1 = 360
+        }
+        withAnimation(.linear(duration: 35).repeatForever(autoreverses: false)) {
+            ringRotation2 = -360
+        }
+        withAnimation(.linear(duration: 55).repeatForever(autoreverses: false)) {
+            ringRotation3 = 360
+        }
+
+        // Core breathing pulse
+        withAnimation(.easeInOut(duration: 2.5).repeatForever(autoreverses: true)) {
+            corePulse = 1.08
+        }
+
+        // Start waveform updates
+        startWaveformSimulation()
     }
 
-    private func updateOrbAnimation(for state: VoicePipeline.ListeningState) {
-        switch state {
-        case .idle:
-            orbScale = 1.0
-            orbOpacity = 0.3
-        case .waitingForWakeWord:
-            orbScale = 1.05
-            orbOpacity = 0.4
-        case .listening:
-            orbScale = 1.2
-            orbOpacity = 0.9
-        case .transcribing:
-            orbScale = 1.1
-            orbOpacity = 0.7
+    private func startWaveformSimulation() {
+        waveformTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { _ in
+            let levels = voicePipeline.currentAudioLevels
+            if !levels.isEmpty {
+                audioLevels = levels
+            } else if voicePipeline.state == .listening {
+                // Subtle idle animation when listening but no level data yet
+                audioLevels = (0..<40).map { _ in CGFloat.random(in: 0.02...0.12) }
+            }
         }
     }
 
     // MARK: - Status
 
-    private var statusLabel: some View {
-        VStack(spacing: 8) {
-            Text(statusMessage)
-                .font(.headline)
-                .foregroundStyle(.white.opacity(0.9))
-
-            if !voicePipeline.currentTranscript.isEmpty {
-                Text("\"\(voicePipeline.currentTranscript)\"")
-                    .font(.subheadline)
-                    .foregroundStyle(.cyan.opacity(0.8))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .transition(.opacity)
-            }
-        }
-        .animation(.easeInOut(duration: 0.3), value: voicePipeline.state)
-    }
-
     private var statusMessage: String {
         switch voicePipeline.state {
         case .idle:
-            return statusText
+            return "OFFLINE"
         case .waitingForWakeWord:
-            return "Say \"Hey Jarvis\"..."
+            return "AWAITING COMMAND"
         case .listening:
-            return "Listening..."
+            return "LISTENING"
         case .transcribing:
-            return "Processing..."
-        }
-    }
-
-    private var connectionIndicator: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(connectionColor)
-                .frame(width: 8, height: 8)
-
-            Text(connectionLabel)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.5))
+            return "PROCESSING"
+        case .conversational:
+            return "ACTIVE SESSION"
         }
     }
 
     private var connectionColor: Color {
         switch webSocket.state {
-        case .connected: return .green
-        case .connecting: return .yellow
-        case .disconnected: return .red
+        case .connected: return JarvisColors.success
+        case .connecting: return JarvisColors.warm
+        case .disconnected: return JarvisColors.danger
         }
     }
 
     private var connectionLabel: String {
         switch webSocket.state {
-        case .connected: return "Connected to Mac Mini"
-        case .connecting: return "Connecting..."
-        case .disconnected: return "Disconnected"
+        case .connected: return "GATEWAY LINK"
+        case .connecting: return "CONNECTING"
+        case .disconnected: return "NO LINK"
         }
     }
 
-    private var windowCounter: some View {
-        Group {
-            if windowManager.windowCount > 0 {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.stack.3d.up")
-                        .foregroundStyle(.cyan.opacity(0.6))
-                    Text("\(windowManager.windowCount) window\(windowManager.windowCount == 1 ? "" : "s") open")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.5))
-                }
-                .transition(.opacity)
-            }
+    private var stateIndicatorColor: Color {
+        switch voicePipeline.state {
+        case .idle: return JarvisColors.textDim
+        case .waitingForWakeWord: return JarvisColors.primary.opacity(0.5)
+        case .listening, .conversational: return JarvisColors.success
+        case .transcribing: return JarvisColors.warm
         }
-        .animation(.easeInOut, value: windowManager.windowCount)
+    }
+
+    private var stateIndicatorLabel: String {
+        switch voicePipeline.state {
+        case .idle: return "STT IDLE"
+        case .waitingForWakeWord: return "WAKE WORD"
+        case .listening: return "STT ACTIVE"
+        case .conversational: return "CONV MODE"
+        case .transcribing: return "WHISPER"
+        }
+    }
+
+    private func timeString(from date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
     }
 
     // MARK: - Setup
@@ -199,6 +429,16 @@ struct ContentView: View {
     private func setupPipelines() {
         webSocket.onMessage = { message in
             windowManager.handleMessage(message)
+
+            // When Jarvis responds, switch to conversational mode briefly
+            if case .speakResponse = message {
+                voicePipeline.enterConversationalMode()
+            }
+        }
+
+        // Handle ElevenLabs audio binary from the server
+        webSocket.onAudioData = { data in
+            windowManager.playElevenLabsAudio(data)
         }
 
         voicePipeline.onTranscript = { transcript in
@@ -211,10 +451,8 @@ struct ContentView: View {
             let granted = await voicePipeline.requestPermissions()
             if granted {
                 voicePipeline.startListening()
-                statusText = "Ready"
             } else {
                 showPermissionAlert = true
-                statusText = "Permissions needed"
             }
         }
     }

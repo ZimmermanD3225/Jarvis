@@ -10,7 +10,7 @@ enum ServerMessage: Decodable {
     case pong
 
     enum CodingKeys: String, CodingKey {
-        case type, windowType, windowId, payload, text
+        case type, windowType, windowId, payload, text, hasAudio
     }
 
     init(from decoder: Decoder) throws {
@@ -36,7 +36,8 @@ enum ServerMessage: Decodable {
 
         case "speak_response":
             let text = try container.decode(String.self, forKey: .text)
-            self = .speakResponse(SpeakResponseMessage(text: text))
+            let hasAudio = (try? container.decode(Bool.self, forKey: .hasAudio)) ?? false
+            self = .speakResponse(SpeakResponseMessage(text: text, hasAudio: hasAudio))
 
         case "close_all":
             self = .closeAll
@@ -78,6 +79,7 @@ struct OpenWindowMessage: Identifiable {
 
 struct SpeakResponseMessage {
     let text: String
+    let hasAudio: Bool
 }
 
 // MARK: - Update Window

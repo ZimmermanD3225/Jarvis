@@ -11,6 +11,7 @@ final class WebSocketClient {
 
     private(set) var state: ConnectionState = .disconnected
     var onMessage: ((ServerMessage) -> Void)?
+    var onAudioData: ((Data) -> Void)?  // ElevenLabs audio binary
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var session: URLSession
@@ -19,6 +20,7 @@ final class WebSocketClient {
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 10
     private let baseReconnectDelay: TimeInterval = 2.0
+    private var expectingAudio = false
 
     init(host: String = "192.168.1.50", port: Int = 7474) {
         self.serverURL = URL(string: "ws://\(host):\(port)")!
@@ -44,12 +46,18 @@ final class WebSocketClient {
         guard state == .connected else { return }
         let message = VoiceInputMessage(transcript: transcript)
         guard let data = try? JSONEncoder().encode(message) else { return }
-        let wsMessage = URLSessionWebSocketTask.Message.data(data)
-        webSocketTask?.send(wsMessage) { error in
+        webSocketTask?.send(.data(data)) { error in
             if let error {
                 print("[WebSocket] Send error: \(error.localizedDescription)")
             }
         }
+    }
+
+    func sendWindowClosed(windowId: String) {
+        guard state == .connected else { return }
+        let msg = ["type": "window_closed", "windowId": windowId]
+        guard let data = try? JSONSerialization.data(withJSONObject: msg) else { return }
+        webSocketTask?.send(.data(data)) { _ in }
     }
 
     private func establishConnection() {
@@ -78,24 +86,41 @@ final class WebSocketClient {
     }
 
     private func handleRawMessage(_ message: URLSessionWebSocketTask.Message) {
-        let data: Data
         switch message {
-        case .data(let d):
-            data = d
-        case .string(let s):
-            guard let d = s.data(using: .utf8) else { return }
-            data = d
-        @unknown default:
-            return
-        }
-
-        do {
-            let serverMessage = try JSONDecoder().decode(ServerMessage.self, from: data)
-            DispatchQueue.main.async { [weak self] in
-                self?.onMessage?(serverMessage)
+        case .data(let data):
+            // If we're expecting audio binary (ElevenLabs MP3), route to audio handler
+            if expectingAudio {
+                expectingAudio = false
+                DispatchQueue.main.async { [weak self] in
+                    self?.onAudioData?(data)
+                }
+                return
             }
-        } catch {
-            print("[WebSocket] Decode error: \(error.localizedDescription)")
+
+            // Otherwise try to decode as JSON
+            if let serverMessage = try? JSONDecoder().decode(ServerMessage.self, from: data) {
+                // Check if the next message will be audio
+                if case .speakResponse(let msg) = serverMessage, msg.hasAudio {
+                    expectingAudio = true
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.onMessage?(serverMessage)
+                }
+            }
+
+        case .string(let text):
+            guard let data = text.data(using: .utf8) else { return }
+            if let serverMessage = try? JSONDecoder().decode(ServerMessage.self, from: data) {
+                if case .speakResponse(let msg) = serverMessage, msg.hasAudio {
+                    expectingAudio = true
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.onMessage?(serverMessage)
+                }
+            }
+
+        @unknown default:
+            break
         }
     }
 
@@ -123,6 +148,7 @@ final class WebSocketClient {
         pingTimer?.invalidate()
         pingTimer = nil
         webSocketTask = nil
+        expectingAudio = false
         attemptReconnect()
     }
 

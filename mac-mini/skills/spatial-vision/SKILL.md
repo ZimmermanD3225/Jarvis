@@ -37,6 +37,8 @@ This skill runs a WebSocket server on port 7474 that connects to the JarvisVisio
    OPENAI_API_KEY=sk-...
    JARVIS_WS_PORT=7474
    MAC_MINI_IP=192.168.1.50
+   ELEVENLABS_API_KEY=...          # Optional — enables premium TTS
+   ELEVENLABS_VOICE_ID=pNInz6obpgDQGcFmaJgB  # "Adam" voice
    ```
 
 ## Starting the Server

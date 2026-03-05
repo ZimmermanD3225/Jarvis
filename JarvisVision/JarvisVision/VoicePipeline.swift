@@ -10,10 +10,12 @@ final class VoicePipeline {
         case waitingForWakeWord
         case listening
         case transcribing
+        case conversational  // After Jarvis responds — stays listening without wake word
     }
 
     private(set) var state: ListeningState = .idle
     private(set) var currentTranscript: String = ""
+    private(set) var currentAudioLevels: [CGFloat] = []
 
     var onTranscript: ((String) -> Void)?
 
@@ -23,9 +25,22 @@ final class VoicePipeline {
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioBuffer: [Data] = []
     private var silenceTimer: Timer?
-    private let silenceThreshold: TimeInterval = 1.5
+    private var conversationalTimeout: Timer?
+
+    // Tunable thresholds
+    private let commandSilenceThreshold: TimeInterval = 2.0
+    private let conversationalSilenceThreshold: TimeInterval = 3.5  // Longer for thinking out loud
+    private let conversationalWindowDuration: TimeInterval = 30.0   // Stay conversational for 30s after Jarvis speaks
     private let wakePhrase = "hey jarvis"
     private var isCapturingCommand = false
+
+    // Audio level tracking
+    private let levelSampleCount = 40
+    private var rawLevels: [Float] = []
+
+    var currentSilenceThreshold: TimeInterval {
+        state == .conversational ? conversationalSilenceThreshold : commandSilenceThreshold
+    }
 
     func requestPermissions() async -> Bool {
         let micGranted = await withCheckedContinuation { continuation in
@@ -59,9 +74,31 @@ final class VoicePipeline {
         recognitionTask = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
+        conversationalTimeout?.invalidate()
+        conversationalTimeout = nil
         isCapturingCommand = false
         audioBuffer.removeAll()
+        rawLevels.removeAll()
+        currentAudioLevels.removeAll()
         state = .idle
+    }
+
+    func enterConversationalMode() {
+        conversationalTimeout?.invalidate()
+
+        if state == .waitingForWakeWord || state == .listening {
+            state = .conversational
+        }
+
+        // Auto-revert to wake-word mode after the conversational window expires
+        conversationalTimeout = Timer.scheduledTimer(withTimeInterval: conversationalWindowDuration, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            if self.state == .conversational {
+                DispatchQueue.main.async {
+                    self.state = .waitingForWakeWord
+                }
+            }
+        }
     }
 
     // MARK: - Wake Word Detection (SFSpeechRecognizer — on-device)
@@ -82,10 +119,12 @@ final class VoicePipeline {
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
+            guard let self else { return }
+            self.recognitionRequest?.append(buffer)
+            self.updateAudioLevels(buffer: buffer)
 
-            if self?.isCapturingCommand == true {
-                self?.appendBufferToCapture(buffer)
+            if self.isCapturingCommand {
+                self.appendBufferToCapture(buffer)
             }
         }
 
@@ -95,12 +134,27 @@ final class VoicePipeline {
             if let result {
                 let text = result.bestTranscription.formattedString.lowercased()
 
+                // In conversational mode: any speech triggers command capture (no wake word needed)
+                if self.state == .conversational && !self.isCapturingCommand {
+                    let recentText = self.recentTranscriptionText(from: result.bestTranscription)
+                    if !recentText.isEmpty {
+                        self.activateCommandCapture(skipWakeWord: true)
+                    }
+                }
+
+                // In wake-word mode: listen for "hey jarvis"
                 if !self.isCapturingCommand && text.contains(self.wakePhrase) {
-                    self.activateCommandCapture()
+                    self.activateCommandCapture(skipWakeWord: false)
                 }
 
                 if self.isCapturingCommand {
-                    let commandText = self.extractCommandAfterWakeWord(from: result.bestTranscription.formattedString)
+                    let commandText: String
+                    if self.state == .conversational {
+                        commandText = self.recentTranscriptionText(from: result.bestTranscription)
+                    } else {
+                        commandText = self.extractCommandAfterWakeWord(from: result.bestTranscription.formattedString)
+                    }
+
                     DispatchQueue.main.async {
                         self.currentTranscript = commandText
                     }
@@ -121,17 +175,45 @@ final class VoicePipeline {
         }
     }
 
-    private func activateCommandCapture() {
+    // MARK: - Audio Level Metering
+
+    private func updateAudioLevels(buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData else { return }
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return }
+
+        let channelSamples = Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
+
+        // RMS level
+        let rms = sqrt(channelSamples.map { $0 * $0 }.reduce(0, +) / Float(frameLength))
+        let normalizedLevel = min(1.0, rms * 5.0) // Amplify for visual impact
+
+        rawLevels.append(normalizedLevel)
+        if rawLevels.count > levelSampleCount {
+            rawLevels.removeFirst(rawLevels.count - levelSampleCount)
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.currentAudioLevels = self.rawLevels.map { CGFloat($0) }
+        }
+    }
+
+    // MARK: - Command Capture
+
+    private func activateCommandCapture(skipWakeWord: Bool) {
         guard !isCapturingCommand else { return }
         isCapturingCommand = true
         audioBuffer.removeAll()
-        state = .listening
+        if state != .conversational {
+            state = .listening
+        }
         resetSilenceTimer()
     }
 
     private func resetSilenceTimer() {
         silenceTimer?.invalidate()
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceThreshold, repeats: false) { [weak self] _ in
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: currentSilenceThreshold, repeats: false) { [weak self] _ in
             self?.finishCommandCapture()
         }
     }
@@ -144,10 +226,11 @@ final class VoicePipeline {
         let transcript = currentTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if transcript.isEmpty {
-            state = .waitingForWakeWord
+            state = state == .conversational ? .conversational : .waitingForWakeWord
             return
         }
 
+        let returnState = state == .conversational ? ListeningState.conversational : .waitingForWakeWord
         state = .transcribing
 
         Task {
@@ -157,7 +240,7 @@ final class VoicePipeline {
                 self.currentTranscript = finalTranscript
                 self.onTranscript?(finalTranscript)
                 self.audioBuffer.removeAll()
-                self.state = .waitingForWakeWord
+                self.state = returnState
                 self.currentTranscript = ""
             }
         }
@@ -175,6 +258,15 @@ final class VoicePipeline {
         guard let range = lower.range(of: wakePhrase) else { return fullText }
         let afterWake = fullText[range.upperBound...]
         return afterWake.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func recentTranscriptionText(from transcription: SFTranscription) -> String {
+        // Get text from the last few seconds of transcription segments
+        let segments = transcription.segments
+        guard !segments.isEmpty else { return "" }
+        let recentCutoff = segments.last!.timestamp - 10.0  // Last 10 seconds
+        let recentSegments = segments.filter { $0.timestamp >= recentCutoff }
+        return recentSegments.map { $0.substring }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func restartWakeWordDetection() {
@@ -207,6 +299,7 @@ final class VoicePipeline {
         let boundary = UUID().uuidString
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/transcriptions")!)
         request.httpMethod = "POST"
+        request.timeoutInterval = 15
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
@@ -218,6 +311,9 @@ final class VoicePipeline {
         body.append("\r\n--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"model\"\r\n\r\n".data(using: .utf8)!)
         body.append("whisper-1\r\n".data(using: .utf8)!)
+        body.append("\r\n--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"language\"\r\n\r\n".data(using: .utf8)!)
+        body.append("en\r\n".data(using: .utf8)!)
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
 
