@@ -1,0 +1,81 @@
+{
+  "// INSTRUCTIONS": "Copy this to ~/.openclaw/openclaw.json and fill in your API keys",
+
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-5"
+      },
+      "workspace": "~/.openclaw/workspace"
+    }
+  },
+
+  "auth": {
+    "profiles": {
+      "anthropic:default": {
+        "provider": "anthropic",
+        "mode": "api_key"
+      }
+    }
+  },
+
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token"
+    }
+  },
+
+  "skills": {
+    "load": {
+      "extraDirs": [
+        "./skills"
+      ]
+    },
+    "enabled": {
+      "spatial-vision": true
+    },
+    "config": {
+      "spatial-vision": {
+        "wsPort": 7474
+      }
+    }
+  },
+
+  "mcp": {
+    "servers": {
+      "caddis-cmms": {
+        "command": "node",
+        "args": ["./mcp-servers/caddis/index.js"],
+        "transport": "stdio",
+        "// description": "Equipment status, work orders, maintenance schedules, sensor readings"
+      },
+      "jobcost-epicor": {
+        "command": "node",
+        "args": ["./mcp-servers/epicor/index.js"],
+        "transport": "stdio",
+        "// description": "Job cost performance, scrap data, labor hours, open orders"
+      },
+      "industrial-server": {
+        "command": "node",
+        "args": ["./mcp-servers/industrial/index.js"],
+        "transport": "stdio",
+        "// description": "PLC/SCADA data, machine cycle counts, OEE metrics"
+      },
+      "leclaire-email": {
+        "command": "node",
+        "args": ["./mcp-servers/email/index.js"],
+        "transport": "stdio",
+        "// description": "Email summaries, urgent flags, draft responses"
+      }
+    }
+  },
+
+  "security": {
+    "sandbox": {
+      "enabled": true
+    }
+  }
+}

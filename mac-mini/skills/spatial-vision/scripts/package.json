@@ -1,0 +1,18 @@
+{
+  "name": "jarvis-spatial-vision",
+  "version": "1.0.0",
+  "description": "OpenClaw spatial skill — WebSocket bridge to Apple Vision Pro",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
